@@ -9,12 +9,13 @@
 #include "xposed_safemode.h"
 #include "xposed_service.h"
 
-#include <stdlib.h>
+#include <ctype.h>
 #include <cutils/process_name.h>
 #include <cutils/properties.h>
-#include <fcntl.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <stdlib.h>
 
 #if PLATFORM_SDK_VERSION >= 18
 #include <sys/capability.h>
@@ -33,6 +34,8 @@ static int sdkVersion = -1;
 static char* argBlockStart;
 static size_t argBlockLength;
 
+const char* xposedVersion = "unknown (invalid " XPOSED_PROP_FILE ")";
+uint32_t xposedVersionInt = 0;
 
 ////////////////////////////////////////////////////////////
 // Functions
@@ -40,8 +43,10 @@ static size_t argBlockLength;
 
 /** Handle special command line options. */
 bool handleOptions(int argc, char* const argv[]) {
+    parseXposedProp();
+
     if (argc == 2 && strcmp(argv[1], "--xposedversion") == 0) {
-        printf("Xposed version: " XPOSED_VERSION "\n");
+        printf("Xposed version: %s\n", xposedVersion);
         return true;
     }
 
@@ -76,6 +81,7 @@ bool initialize(bool zygote, bool startSystemServer, const char* className, int 
     xposed->zygote = zygote;
     xposed->startSystemServer = startSystemServer;
     xposed->startClassName = className;
+    xposed->xposedVersionInt = xposedVersionInt;
 
 #if XPOSED_WITH_SELINUX
     xposed->isSELinuxEnabled   = is_selinux_enabled() == 1;
@@ -140,7 +146,7 @@ void printRomInfo() {
     property_get("ro.product.cpu.abi", platform, "n/a");
 
     ALOGI("-----------------");
-    ALOGI("Starting Xposed binary version %s, compiled for SDK %d", XPOSED_VERSION, PLATFORM_SDK_VERSION);
+    ALOGI("Starting Xposed version %s, compiled for SDK %d", xposedVersion, PLATFORM_SDK_VERSION);
     ALOGI("Device: %s (%s), Android version %s (SDK %s)", model, manufacturer, release, sdk);
     ALOGI("ROM: %s", rom);
     ALOGI("Build fingerprint: %s", fingerprint);
@@ -153,6 +159,58 @@ void printRomInfo() {
             xposed->isSELinuxEnforcing ? "yes" : "no");
 }
 
+/** Parses /system/xposed.prop and stores selected values in variables */
+void parseXposedProp() {
+    FILE *fp = fopen(XPOSED_PROP_FILE, "r");
+    if (fp == NULL) {
+        ALOGE("Could not read %s: %s", XPOSED_PROP_FILE, strerror(errno));
+        return;
+    }
+
+    char buf[512];
+    while (fgets(buf, sizeof(buf), fp) != NULL) {
+        char* key = buf;
+        // Ignore leading spaces for the key
+        while (isspace(*key)) key++;
+
+        // Skip comments
+        if (*key == '#')
+            continue;
+
+        // Find the key/value separator
+        char* value = strchr(buf, '=');
+        if (value == NULL)
+            continue;
+
+        // Ignore trailing spaces for the key
+        char* tmp = value;
+        do { *tmp = 0; tmp--; } while (isspace(*tmp));
+
+        // Ignore leading spaces for the value
+        do { value++; } while (isspace(*value));
+
+        // Remove trailing newline
+        tmp = strpbrk(value, "\n\r");
+        if (tmp != NULL)
+            *tmp = 0;
+
+        // Handle this entry
+        if (!strcmp("version", key)) {
+            int len = strlen(value);
+            if (len == 0)
+                continue;
+            tmp = (char*) malloc(len + 1);
+            strlcpy(tmp, value, len + 1);
+            xposedVersion = tmp;
+            xposedVersionInt = atoi(xposedVersion);
+        }
+    }
+    fclose(fp);
+
+    return;
+}
+
+/** Returns the SDK version of the system */
 int getSdkVersion() {
     if (sdkVersion < 0) {
         char sdkString[PROPERTY_VALUE_MAX];
@@ -345,14 +403,23 @@ void setProcessName(const char* name) {
 
 
 /** Drop all capabilities except for the mentioned ones */
-void dropCapabilities(int keep) {
+void dropCapabilities(int8_t keep[]) {
     struct __user_cap_header_struct header;
-    struct __user_cap_data_struct cap;
-    header.version = _LINUX_CAPABILITY_VERSION;
+    struct __user_cap_data_struct cap[2];
+    memset(&header, 0, sizeof(header));
+    memset(&cap, 0, sizeof(cap));
+    header.version = _LINUX_CAPABILITY_VERSION_3;
     header.pid = 0;
-    cap.effective = cap.permitted = keep;
-    cap.inheritable = 0;
-    capset(&header, &cap);
+
+    if (keep != NULL) {
+      for (int i = 0; keep[i] >= 0; i++) {
+        cap[CAP_TO_INDEX(keep[i])].permitted |= CAP_TO_MASK(keep[i]);
+      }
+      cap[0].effective = cap[0].inheritable = cap[0].permitted;
+      cap[1].effective = cap[1].inheritable = cap[1].permitted;
+    }
+
+    capset(&header, &cap[0]);
 }
 
 }  // namespace xposed
